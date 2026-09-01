@@ -1,41 +1,186 @@
-# Legal Research Agent — modular structure
+# Verdikt 
 
-## Layout
+## 1. What it is
+
+Verdikt is an AI research agent for Indian criminal law. Given a case — either
+structured offences/allegations or a raw, messy free-form description — it produces a
+structured legal research memo: the applicable statutory provisions, relevant judicial
+precedent pulled from the live web, and a final reasoned legal analysis, with every
+claim traceable back to real statute text or a real search result.
+
+It is built around three ideas:
+
+1. **Retrieval should be hybrid.** Statutory language and everyday legal language
+   don't always match. A client says "FIR"; the statute says "information in
+   cognizable cases." Keyword search alone misses semantic matches; vector search
+   alone misses exact statutory phrasing. Verdikt runs both and fuses the results.
+2. **Precedent must be found live, not recalled.** An LLM's training data is a stale
+   snapshot. Judicial research is done through real-time web search, every run.
+3. **Authority is not the LLM's call.** A model can *assess* how relevant or credible
+   a source looks, but whether that source is allowed to carry weight — Supreme Court
+   judgment vs. legal blog vs. news report — is enforced by deterministic rules, not
+   left to the model's judgment.
+
+## surfaces
+
+| Surface | Entry point | Use case |
+|---|---|---|
+| CLI — fixed case | `python -m cli.pipeline` | Run the pipeline against a hardcoded sample case (development, testing, demos) |
+| CLI — free-form agent | `python -m cli.agent` | Paste in a raw client narrative; the agent extracts the legal facts itself first |
+| Web UI | `streamlit run ui/app.py` | Interactive research tool — enter a case, watch each stage run, browse ranked precedent and the final memo in tabs |
+
+## Pipeline stages
+
+```
+User input (structured or raw free-form query)
+        │
+        ▼
+┌───────────────────────┐
+│ Stage 0 — Case Fact    │  (free-form queries only)
+│ Extraction             │  raw text → structured offences + allegations
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Stage 1 — Statute      │  BM25 (keyword) + Chroma (vector) search
+│ Retrieval              │  over BNS / BNSS / BSA, fused via
+│                        │  Reciprocal Rank Fusion (RRF)
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Stage 2 — Research     │  LLM reads statutes + case facts,
+│ Planning               │  produces a structured research plan
+│                        │  + search queries
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Stage 3 — Judicial     │  Live web search (parallel) against the
+│ Research               │  planned queries; results deduplicated
+│                        │  and compressed
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Stage 4 — Precedent     │  LLM classifies each result by source type
+│ Ranking                │  and scores relevance; Python enforces a
+│                        │  hard authority CAP per source type
+│                        │  (judgment > tribunal > commentary > blog)
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Stage 5 — Final Legal   │  LLM synthesizes statutes + plan + ranked
+│ Reasoning              │  precedent into the final structured
+│                        │  research output
+└───────────┬───────────┘
+            ▼
+   Structured legal research memo (JSON)
+   applicable_law · precedent_analysis ·
+   sections_applied · final reasoning
+```
+
+### Why Stage 4 is the core design decision
+
+Every other stage hands off judgment to an LLM and moves on. Stage 4 doesn't. The
+ranker LLM assigns a `judicial_authority_score` and a `source_type` to each candidate —
+but that score is then passed through a fixed ceiling table before it's allowed to
+influence the final selection:
+
+```python
+SOURCE_TYPE_AUTHORITY_CAPS = {
+    "supreme_court_judgment": 100,
+    "high_court_judgment":     90,
+    "tribunal_decision":       75,
+    "judgment_repository":     65,
+    "legal_commentary":        35,
+    "legal_blog":              20,
+    "news_report":             15,
+    "generic_information":     10,
+    "video":                    0,
+    "social_media":             0,
+    "unknown":                 25,
+}
+```
+
+No matter how highly the model scores a blog post, it cannot cross the ceiling
+assigned to its source type. This is what keeps the final memo's precedent list
+actually authoritative rather than just "whatever ranked highest by vibes."
+
+## System architecture
+
+```
+                         ┌─────────────────────────────┐
+                         │        User-facing layer      │
+                         │                              │
+                         │  cli/pipeline.py              │
+                         │  cli/agent.py                 │
+                         │  ui/app.py  (Streamlit)        │
+                         └───────────────┬──────────────┘
+                                         │  orchestrates stages,
+                                         │  handles I/O
+                                         ▼
+                         ┌─────────────────────────────┐
+                         │            core/               │
+                         │                              │
+                         │  config.py    — env, models,   │
+                         │                 tunables, caps  │
+                         │  models.py    — Pydantic schemas│
+                         │  llm.py       — structured LLM  │
+                         │                 output helpers   │
+                         │  extraction.py — Stage 0        │
+                         │  retrieval.py  — Stage 1        │
+                         │  planning.py   — Stage 2        │
+                         │  web_search.py — Stage 3        │
+                         │  ranking.py    — Stage 4        │
+                         │  reasoning.py  — Stage 5        │
+                         │  output.py     — printing/saving│
+                         └───┬────────────────┬──────────┘
+                             │                │
+                 ┌───────────▼──────┐   ┌─────▼─────────┐
+                 │   vectorstore/     │   │  External APIs  │
+                 │                    │   │                │
+                 │  build_vector_db.py│   │  Groq — LLM     │
+                 │  query_vector_db.py│   │  inference      │
+                 │  chroma_db/  (DB)   │   │                │
+                 └───────────┬──────┘   │  Tavily — live  │
+                             │           │  web search     │
+                       ┌─────▼─────┐    └────────────────┘
+                       │   data/     │
+                       │  BNS/BNSS/  │
+                       │  BSA CSVs   │
+                       └────────────┘
+```
+
+**Data flow at retrieval time:** `data/*.csv` is ingested once by
+`vectorstore/build_vector_db.py` into a persistent Chroma collection. At query time,
+`core/retrieval.py` calls `vectorstore/query_vector_db.py`'s `hybrid_search()`, which
+runs BM25 over the raw corpus and a Chroma vector query in parallel, then fuses the two
+ranked lists with Reciprocal Rank Fusion before returning the top statute sections.
+
+## Repository structure
 
 ```
 legal_research_agent/
-├── core/            # shared pipeline logic (single source of truth)
-│   ├── config.py       # env keys, model names, tunables, SOURCE_TYPE_AUTHORITY_CAPS, groq/tavily clients
-│   ├── models.py       # all Pydantic schemas (ResearchPlan, CandidateAssessment, LegalResearchOutput, ...)
-│   ├── llm.py           # strict_schema() + groq_structured() (CLI version)
-│   ├── retrieval.py     # STEP 1 — real hybrid BM25 + Chroma statute retrieval
-│   ├── planning.py      # STEP 2 — Groq 120B research planner
-│   ├── web_search.py    # STEP 3 — Tavily search, compression, dedup (CLI version)
-│   ├── ranking.py       # STEP 4 — Groq 20B ranker + source classifier + Python selection (CLI version)
-│   ├── reasoning.py     # STEP 5 — final Groq 120B legal reasoning (CLI version, no raw-query param)
-│   ├── extraction.py    # STEP 0 — case-fact extraction (used only by cli/agent.py)
-│   └── output.py        # console pretty-printers + save_final_output()
+├── core/                    # shared pipeline logic — one implementation per stage
+│   ├── config.py               # env keys, model names, tunables, authority caps, API clients
+│   ├── models.py                # Pydantic schemas for every stage's structured output
+│   ├── llm.py                    # strict_schema() + groq_structured()
+│   ├── extraction.py             # Stage 0
+│   ├── retrieval.py              # Stage 1
+│   ├── planning.py               # Stage 2
+│   ├── web_search.py             # Stage 3
+│   ├── ranking.py                # Stage 4
+│   ├── reasoning.py              # Stage 5
+│   └── output.py                  # console printers + save_final_output()
 │
-├── cli/             # thin CLI entry points, no business logic of their own
-│   ├── pipeline.py     # `python -m cli.pipeline`  — fixed OFFENCES/ALLEGATION sample case
-│   └── agent.py        # `python -m cli.agent`     — free-form query -> case-fact extraction -> pipeline
-│                          (keeps its own final_legal_reasoning_with_query(), the one function that
-│                           genuinely differs from core.reasoning.final_legal_reasoning())
+├── cli/
+│   ├── pipeline.py               # entry point: fixed sample case
+│   └── agent.py                  # entry point: free-form query
 │
 ├── ui/
-│   └── app.py           # Streamlit app (`streamlit run ui/app.py`)
-│                          Imports the pieces from core/ that were byte-identical to the CLI's
-│                          (models, strict_schema, normalize_whitespace, infer_domain,
-│                          compress_tavily_result, deduplicate_results) and now uses the REAL
-│                          Chroma+BM25 retrieval from core.retrieval instead of the old
-│                          retrieve_statutes_stub() keyword-matching fake.
-│                          Its own planner/ranker/reasoner/tavily-search prompts and logic are
-│                          genuinely different from the CLI's and were left in place unchanged.
+│   └── app.py                     # Streamlit web app
 │
 ├── vectorstore/
-│   ├── build_vector_db.py   # one-time ingestion: data/*.csv -> chroma_db/
-│   ├── query_vector_db.py   # hybrid_search() (BM25 + Chroma via RRF), used by core.retrieval
-│   └── chroma_db/           # the real, persisted Chroma DB (untouched, just relocated)
+│   ├── build_vector_db.py        # CSV → Chroma ingestion
+│   ├── query_vector_db.py        # hybrid_search() (BM25 + Chroma + RRF)
+│   └── chroma_db/                  # persisted vector database
 │
 ├── data/
 │   ├── BNS_sections.csv
@@ -44,51 +189,16 @@ legal_research_agent/
 │
 ├── requirements.txt
 ├── .env
-└── legal_research_output.json   # sample saved output
+└── legal_research_output.json    # example output
 ```
 
-## What changed vs. the original flat layout
+## Tech stack
 
-- **No behavior changes to any function that had real, distinct logic.** Before touching
-  anything, every function/class in `agent.py`, `research-pipeline.py`, and `app.py` was
-  compared at the AST level (not just text diffed) to confirm which were truly identical
-  vs. genuinely different. Only truly-identical code was merged into `core/`.
-- `agent.py` and `research-pipeline.py` were ~95% byte-identical already; that shared code
-  now lives once in `core/`, and each CLI script is a thin `main()` that calls it.
-- `app.py`'s planner/ranker/selection/reasoning/Tavily-search prompts genuinely differ from
-  the CLI's (different prompt wording, different weighting) — those were **left untouched**
-  in `ui/app.py` rather than force-merged, per your instruction that other functions remain
-  as-is.
-- `ui/app.py`'s `retrieve_statutes_stub()` — a hardcoded keyword-matcher with a handful of
-  fake sections, completely disconnected from the vector DB — was replaced with the real
-  hybrid BM25 + Chroma retrieval (`core.retrieval`), against the same `chroma_db/` the CLI
-  tools use. This was the one explicit behavior change you asked for.
-
-## Two things worth flagging (found during the refactor, not introduced by it)
-
-1. **`app.py` had live Groq and Tavily API keys hardcoded in plaintext** (and committed to
-   `.git`). They've been switched to `os.getenv("GROQ_API_KEY")` / `os.getenv("TAVILY_API_KEY")`,
-   matching the `.env`-based approach the rest of the project already uses. **Rotate both
-   keys in their provider dashboards** — being in source control (even briefly) means they
-   should be treated as compromised.
-2. `requirements.txt` was missing `chromadb` and `rank_bm25`, even though `build_vector_db.py`
-   / `query_vector_db.py` import them directly. Added both.
-
-## Running it
-
-```bash
-pip install -r requirements.txt
-
-# one-time: build the vector DB from data/*.csv (already built and included, but if you
-# need to rebuild it after editing the CSVs):
-python -m vectorstore.build_vector_db
-
-# CLI, fixed sample case:
-python -m cli.pipeline
-
-# CLI, free-form query with case-fact extraction:
-python -m cli.agent
-
-# Streamlit UI:
-streamlit run ui/app.py
-```
+| Layer | Tool | Role |
+|---|---|---|
+| LLM inference | **Groq** | Case extraction, planning, ranking, final reasoning |
+| Web search | **Tavily** | Live judicial precedent lookup |
+| Vector store | **ChromaDB** | Semantic statute retrieval |
+| Keyword search | **rank_bm25** | Lexical statute retrieval, fused with vector search |
+| Schema validation | **Pydantic** | Structured, validated output at every stage |
+| UI | **Streamlit** | Interactive web app |
