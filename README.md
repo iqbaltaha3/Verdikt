@@ -21,6 +21,8 @@ It is built around three ideas:
    judgment vs. legal blog vs. news report — is enforced by deterministic rules, not
    left to the model's judgment.
 
+   read blog here -> https://medium.com/@iqbaltaha3/teaching-an-ai-to-think-like-a-legal-researcher-5d31c1405e27?sharedUserId=iqbaltaha3
+
 ## surfaces
 
 | Surface | Entry point | Use case |
